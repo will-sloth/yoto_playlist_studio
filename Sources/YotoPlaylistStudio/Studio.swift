@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 final class Studio: ObservableObject {
     @Published var clientID = UserDefaults.standard.string(forKey: "clientID") ?? ""
     @Published var playlists: [Playlist] = []
+    @Published var newPlaylists: [String: JSON] = [:]
     @Published var icons: [LibraryIcon] = []
     @Published var existingIconURLs: [String: URL] = [:]
     @Published var iconLoadMessage: String?
@@ -17,7 +18,7 @@ final class Studio: ObservableObject {
     }
     func loadExistingIcons() async {
         existingIconURLs = [:]; iconLoadMessage = nil
-        guard !demo, connected, let id = card["cardId"] as? String else { return }
+        guard !demo, connected, let id = card["cardId"] as? String, newPlaylists[id] == nil else { return }
         do {
             let owned = try await api.icons(owned: true)
             guard selectedPlaylist == id, connected else { return }
@@ -100,12 +101,30 @@ final class Studio: ObservableObject {
             do { try await action() } catch { self.error = error.localizedDescription }
         }
     }
+    func startPlaylist(title: String) throws {
+        var draftCard = try CardEditor.newPlaylist(title: title)
+        let id = "new-" + UUID().uuidString
+        draftCard["cardId"] = id
+        newPlaylists[id] = draftCard
+        playlists.append(Playlist(id: id, title: (draftCard["title"] as? String ?? "New playlist") + " (new)"))
+        card = draftCard; selectedPlaylist = id; selectedTracks = []; draft = [:]; suggestions = [:]; rejected = [:]
+        existingIconURLs = [:]; iconLoadMessage = nil
+        status = "New playlist ready. Add audio to save it to Yoto."
+    }
+    func refreshPlaylists() {
+        run {
+            let saved = try await self.api.playlists()
+            let pending = self.newPlaylists.compactMap { id, card in (card["title"] as? String).map { Playlist(id: id, title: $0 + " (new)") } }
+            self.playlists = saved + pending
+            self.status = "Playlist list refreshed."
+        }
+    }
     func connect() {
         run {
             try await self.api.login(clientID: self.clientID)
             UserDefaults.standard.set(self.clientID, forKey: "clientID")
             self.connected = true; self.demo = false
-            self.suggestions = [:]; self.rejected = [:]
+            self.suggestions = [:]; self.rejected = [:]; self.newPlaylists = [:]
             self.card = [:]; self.draft = [:]; self.selectedTracks = []; self.selectedPlaylist = nil
             self.playlists = try await self.api.playlists()
             self.status = "Connected · \(self.playlists.count) playlists"
@@ -114,7 +133,7 @@ final class Studio: ObservableObject {
     }
     func disconnect() {
         suggestions = [:]; rejected = [:]
-        api.disconnect(); connected = false; demo = false; playlists = []; icons = []
+        api.disconnect(); newPlaylists = [:]; connected = false; demo = false; playlists = []; icons = []
         selectedPlaylist = nil; card = [:]; draft = [:]; selectedTracks = []
         status = "Disconnected."
     }
@@ -127,7 +146,9 @@ final class Studio: ObservableObject {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
         run {
-            let result = self.demo ? Self.demoCard : try await self.api.card(id)
+            let result: JSON
+            if let pending = self.newPlaylists[id] { result = pending }
+            else { result = self.demo ? Self.demoCard : try await self.api.card(id) }
             self.suggestions = [:]; self.rejected = [:]
             self.card = result; self.selectedPlaylist = id; self.draft = [:]; self.selectedTracks = []
             self.suggestIcons(onlyMissing: true)
@@ -136,7 +157,7 @@ final class Studio: ObservableObject {
     }
     func openDemo() {
         suggestions = [:]; rejected = [:]
-        demo = true; connected = false; demoArt = [:]
+        newPlaylists = [:]; demo = true; connected = false; demoArt = [:]
         playlists = [Playlist(id: "demo", title: "Bedtime adventures")]
         card = Self.demoCard; selectedPlaylist = "demo"; selectedTracks = []; draft = [:]
         suggestIcons(onlyMissing: true)
@@ -209,10 +230,20 @@ struct YotoPlaylistStudioApp: App {
     }
 }
 
+private struct AudioImportSelection: Identifiable {
+    let id = UUID()
+    let tracks: [PublicAudioTrack]
+}
+
 struct StudioView: View {
     @EnvironmentObject var studio: Studio
     @State private var settings = false
-    @State private var audioImport = false
+    @State private var audioSelection: AudioImportSelection?
+    @State private var publicAudio = false
+    @State private var newPlaylistSheet = false
+    @State private var playlistName = ""
+    @State private var playlistNameError: String?
+    @State private var importTracks: [PublicAudioTrack] = []
     @State private var search = ""
     @State private var retryQueries: [String: String] = [:]
     @State private var generationTrack: TrackRow?
@@ -230,11 +261,12 @@ struct StudioView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 5) {
                         Text(studio.card["title"] as? String ?? "A little art. A lot of personality.").font(.system(size: 25, weight: .semibold, design: .rounded))
-                        Text(studio.demo ? "DEMO PLAYLIST · LOCAL PREVIEW" : "PIXEL ART FOR YOUR YOTO PLAYLISTS").font(.system(size: 10, weight: .bold)).tracking(1.8).foregroundStyle(.secondary)
+                        Text(studio.demo ? "DEMO PLAYLIST · LOCAL PREVIEW" : "AUDIO AND ARTWORK FOR YOUR YOTO PLAYLISTS").font(.system(size: 10, weight: .bold)).tracking(1.8).foregroundStyle(.secondary)
                     }
                     Spacer()
                     if studio.busy { ProgressView().controlSize(.small) }
-                    Button("Add YouTube audio…") { audioImport = true }.disabled(studio.selectedPlaylist == nil || studio.hasChanges || studio.busy).help(studio.hasChanges ? "Apply or discard staged artwork before adding audio" : "Append one YouTube video as a new track")
+                    Button("Add audio…") { importTracks = []; audioSelection = AudioImportSelection(tracks: []) }.disabled(studio.selectedPlaylist == nil || studio.hasChanges || studio.busy).help(studio.hasChanges ? "Apply or discard staged artwork before adding audio" : "Import YouTube links or public audio files")
+                    Button("Public-domain audio…") { importTracks = []; publicAudio = true }.disabled(studio.selectedPlaylist == nil || studio.hasChanges || studio.busy)
                     Button("Review \(studio.draft.count) changes") { studio.review = true }.buttonStyle(.borderedProminent).tint(accent).disabled(!studio.hasChanges || studio.busy)
                 }
                 HStack(alignment: .top, spacing: 24) {
@@ -255,14 +287,39 @@ struct StudioView: View {
             }.padding(28).background(Color(nsColor: .windowBackgroundColor))
         }.tint(accent)
         .disabled(studio.busy)
-        .sheet(isPresented: $audioImport) {
-            AudioImportSheet(card: studio.card, service: studio.api, isDemo: studio.demo) { payload in
+        .sheet(item: $audioSelection) { selection in
+            AudioImportSheet(card: studio.card, service: studio.api, isDemo: studio.demo, initialTracks: selection.tracks, createsPlaylist: studio.selectedPlaylist.map { studio.newPlaylists[$0] != nil } ?? false) { payload in
+                if let previous = studio.selectedPlaylist, studio.newPlaylists.removeValue(forKey: previous) != nil {
+                    studio.playlists.removeAll { $0.id == previous }
+                }
                 studio.card = payload
+                if let id = payload["cardId"] as? String {
+                    studio.selectedPlaylist = id
+                    if !studio.playlists.contains(where: { $0.id == id }) { studio.playlists.append(Playlist(id: id, title: payload["title"] as? String ?? "Playlist")) }
+                }
                 Task { await studio.loadExistingIcons() }
                 studio.suggestions = [:]; studio.rejected = [:]
                 studio.suggestIcons(onlyMissing: true)
                 studio.status = "Audio added to Yoto. Choose artwork for the new track."
             }
+        }
+        .sheet(isPresented: $publicAudio, onDismiss: { if !importTracks.isEmpty { audioSelection = AudioImportSelection(tracks: importTracks) } }) {
+            PublicAudioSheet { tracks in importTracks = tracks }
+        }
+        .sheet(isPresented: $newPlaylistSheet) {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("New playlist").font(.title2.bold())
+                TextField("Playlist name", text: $playlistName).textFieldStyle(.roundedBorder)
+                Text("Choose a name, then add audio. The playlist is saved to Yoto when you upload its first track.").font(.callout).foregroundStyle(.secondary)
+                if let error = playlistNameError { Text(error).font(.caption).foregroundStyle(.red) }
+                HStack {
+                    Button("Cancel") { newPlaylistSheet = false }; Spacer()
+                    Button("Start playlist") {
+                        do { try studio.startPlaylist(title: playlistName); newPlaylistSheet = false }
+                        catch { playlistNameError = error.localizedDescription }
+                    }.buttonStyle(.borderedProminent)
+                }
+            }.padding(26).frame(width: 420)
         }
         .sheet(isPresented: $settings) { connectionSheet }
         .sheet(isPresented: $studio.review) { reviewSheet }
@@ -282,7 +339,12 @@ struct StudioView: View {
                 VStack(alignment: .leading, spacing: 2) { Text("Playlist Studio").font(.system(size: 20, weight: .bold, design: .rounded)); Text("for Yoto").font(.caption).foregroundStyle(.secondary) }
             }.padding(.top, 15)
             Button { settings = true } label: { Label(studio.connected ? "Yoto connected" : "Connect to Yoto", systemImage: "person.crop.circle") }.buttonStyle(.bordered).frame(maxWidth: .infinity)
-            Text("YOUR PLAYLISTS").font(.system(size: 10, weight: .bold)).tracking(1.5).foregroundStyle(.secondary)
+            Button("New playlist…", systemImage: "plus") { playlistName = ""; playlistNameError = nil; newPlaylistSheet = true }.disabled((!studio.connected && !studio.demo) || studio.hasChanges || studio.busy)
+            HStack {
+                Text("YOUR PLAYLISTS").font(.system(size: 10, weight: .bold)).tracking(1.5).foregroundStyle(.secondary)
+                Spacer()
+                if studio.connected { Button("Refresh") { studio.refreshPlaylists() }.font(.caption).disabled(studio.busy) }
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(studio.playlists) { playlist in
@@ -310,7 +372,7 @@ struct StudioView: View {
                 if let message = studio.iconLoadMessage { Text(message).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled) }
             }
             if studio.rows.isEmpty {
-                VStack(spacing: 16) { Image(systemName: "music.note.list").font(.system(size: 35)).foregroundStyle(accent); Text("Choose a playlist to get started").foregroundStyle(.secondary).multilineTextAlignment(.center) }.frame(maxWidth: .infinity, minHeight: 240)
+                VStack(spacing: 16) { Image(systemName: "music.note.list").font(.system(size: 35)).foregroundStyle(accent); Text(studio.selectedPlaylist == nil ? "Choose a playlist to get started" : "Add audio to get started").foregroundStyle(.secondary).multilineTextAlignment(.center) }.frame(maxWidth: .infinity, minHeight: 240)
             }
             ScrollView {
                 VStack(spacing: 8) {

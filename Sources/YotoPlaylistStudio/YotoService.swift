@@ -6,6 +6,11 @@ import AppKit
 @MainActor
 final class YotoService: NSObject {
     private var token = ""
+    private let session: URLSession
+    init(session: URLSession = .shared, accessToken: String = "") {
+        self.session = session; self.token = accessToken
+        super.init()
+    }
     private var listener: NWListener?
     private var loginContinuation: CheckedContinuation<URL, Error>?
     private var loginTimeout: Task<Void, Never>?
@@ -86,7 +91,7 @@ final class YotoService: NSObject {
     private func perform(_ request: URLRequest) async throws -> JSON {
         var request = request
         request.timeoutInterval = 30
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw StudioError("Yoto did not respond.") }
         guard (200..<300).contains(http.statusCode) else {
             if http.statusCode == 401 { throw StudioError("Your Yoto session expired. Disconnect and sign in again.") }
@@ -98,7 +103,9 @@ final class YotoService: NSObject {
             let step: String
             switch request.url?.path {
             case "/media/transcode/audio/uploadUrl": step = "Preparing the audio upload"
-            case "/content": step = "Saving the playlist"
+            case "/content":
+                let payload = request.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) as? JSON }
+                step = payload?["cardId"] == nil ? "Creating the playlist" : "Saving the playlist"
             default: step = "Yoto request"
             }
             throw StudioError("\(step) failed (HTTP \(http.statusCode)): \(safeDetail)")
@@ -175,7 +182,7 @@ final class YotoService: NSObject {
             put.setValue("audio/mpeg", forHTTPHeaderField: "Content-Type")
             // The signed storage URL carries its own authorization. Never forward the Yoto token.
             progress("Uploading MP3 to Yoto…")
-            let (_, uploaded) = try await URLSession.shared.upload(for: put, fromFile: file)
+            let (_, uploaded) = try await session.upload(for: put, fromFile: file)
             guard let http = uploaded as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw StudioError("Yoto's audio upload failed. The playlist has not changed.") }
         }
         progress("Waiting for Yoto to process the audio…")
@@ -188,7 +195,7 @@ final class YotoService: NSObject {
             var poll = URLRequest(url: URL(string: "https://api.yotoplay.com/media/upload/\(safeID)/transcoded?loudnorm=false")!)
             poll.timeoutInterval = 30
             poll.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            let (data, response) = try await URLSession.shared.data(for: poll)
+            let (data, response) = try await session.data(for: poll)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             let object = (try? JSONSerialization.jsonObject(with: data)) as? JSON ?? [:]
             let transcodeFields = object["transcode"] as? JSON ?? [:]
@@ -196,7 +203,7 @@ final class YotoService: NSObject {
             if let error = object["error"] as? JSON { diagnostic["errorCode"] = error["code"]; diagnostic["errorMessage"] = error["message"] }
             if let state = transcodeFields["status"] as? String { diagnostic["status"] = state }
             if let info = transcodeFields["transcodedInfo"] as? JSON { diagnostic["mediaFields"] = info.keys.sorted() }
-            if let data = try? JSONSerialization.data(withJSONObject: diagnostic, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: FileManager.default.temporaryDirectory.appendingPathComponent("yoto-studio-processing.json"), options: .atomic) }
+            if let data = try? JSONSerialization.data(withJSONObject: diagnostic, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: FileManager.default.temporaryDirectory.appendingPathComponent("yoto-studio-processing-" + safeID + ".json"), options: .atomic) }
             if code == 401 { throw StudioError("Your Yoto sign-in expired. Sign in again before uploading.") }
             if code == 403 { throw StudioError("Yoto denied audio access. Check user:content:manage in the developer app.") }
             if (200..<300).contains(code), let object = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
@@ -205,6 +212,18 @@ final class YotoService: NSObject {
             try await Task.sleep(nanoseconds: 2_000_000_000)
         }
         throw StudioError("Yoto audio processing timed out. No track was appended; you can retry.")
+    }
+    func createPlaylist(_ payload: JSON) async throws -> JSON {
+        guard payload["cardId"] == nil, let content = payload["content"] as? JSON,
+              let chapters = content["chapters"] as? [JSON], !chapters.isEmpty else {
+            throw StudioError("Add at least one audio track before creating the playlist.")
+        }
+        let response = try await request("/content", method: "POST", body: JSONSerialization.data(withJSONObject: payload))
+        let card = response["card"] as? JSON ?? response
+        guard let id = card["cardId"] as? String, !id.isEmpty else {
+            throw StudioError("Yoto may have created the playlist but returned no playlist ID. Refresh your library before trying again.")
+        }
+        return card
     }
     @discardableResult
     func save(_ payload: JSON) async throws -> JSON {

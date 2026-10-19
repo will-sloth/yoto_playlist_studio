@@ -42,6 +42,12 @@ enum ArtChoice {
 }
 
 enum CardEditor {
+    static func newPlaylist(title: String) throws -> JSON {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, title.count <= 100 else { throw StudioError("Enter a playlist name of 1–100 characters.") }
+        return ["title": title, "content": ["chapters": [JSON](), "playbackType": "linear"]]
+    }
+
     static func rows(_ card: JSON) -> [TrackRow] {
         let content = card["content"] as? JSON ?? [:]
         return (content["chapters"] as? [JSON] ?? []).enumerated().flatMap { ci, chapter in

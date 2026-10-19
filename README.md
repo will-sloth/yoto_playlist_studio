@@ -1,6 +1,6 @@
 # Yoto Playlist Studio
 
-A small native macOS app for adding 16×16 artwork to existing Make Your Own playlists. Requires macOS 13 or newer. The artwork editor uses native macOS frameworks. YouTube imports require the optional audio tools listed below.
+A small native macOS app for creating and updating Make Your Own playlists, importing audio, and choosing 16×16 artwork. Requires macOS 13 or newer. The artwork editor uses native macOS frameworks. YouTube imports require the optional audio tools listed below.
 
 ## Try it
 
@@ -37,7 +37,7 @@ A JSON snapshot is written before uploads in `~/Library/Application Support/Yoto
 ## Download YouTube audio and append it to an existing playlist
 
 1. Connect to Yoto and choose an existing MYO playlist. Apply or discard any staged icon edits first.
-2. Click **Add YouTube audio…** in the top bar.
+2. Click **Add audio…** in the top bar.
 3. Paste one or more HTTPS YouTube video URLs, one per line, then click **Download MP3s**. Duplicate video URLs are skipped, preserving the first occurrence. Video links with playlist parameters are reduced to the single video; whole-playlist import and live streams are not supported.
 4. For each queued video, the app checks available formats and downloads the best available audio, encodes a stereo 44.1 kHz MP3 at 320 kbps, and verifies the encoded audio stream bitrate using ffprobe. Review each track title and use **Preview** beside it. Failed downloads remain in the queue; **Download / retry** retries those while keeping successful downloads. **Save MP3…** exports a local copy if you want to keep it.
 5. Check the destination playlist shown at the top, then click **Upload N track(s)**. The count includes ready downloads only; failed ones are skipped. This is the final write action. The app uploads the MP3, waits for Yoto's audio processing, saves a JSON playlist backup, then appends the batch in queue order in one final playlist write. If one audio upload fails, no batch tracks are appended; retry reuses already processed media in this window.
@@ -57,7 +57,7 @@ Then click **Check tools** in the audio window. If YouTube changes its download 
 
 Downloads and conversions run as separate local processes without a shell, with configuration/plugin loading disabled. Every completed MP3 is copied to **~/Music/Yoto Playlist Studio** before it is marked ready. **Open local copies** opens that folder. Copies remain after uploading, closing, cancelling later queue items, or editing the link list. Repeat imports check saved MP3s for the same video and reuse a valid 320 kbps copy before contacting YouTube. New downloads get numbered filenames and never overwrite earlier copies. Closing the window only cancels work and removes temporary conversion files; permanent MP3 copies are retained. Upload cannot be dismissed interactively while in progress. A successfully uploaded media file may remain unused in Yoto if processing or playlist saving fails; the app does not automatically retry the final playlist write. If a network failure happens during that final save, check the Yoto playlist before trying again to avoid adding the same track twice. The app checks for playlist changes before and after upload, but the API still has a small race window between the final check and save.
 
-Only existing playlists are supported. Batch imports are supported; album splitting, automatic trimming, and playlist creation are not. Demo mode disables upload. Final playlist saving and custom icon resolution still need live verification.
+Existing and new playlists are supported. Batch imports are supported; album splitting and automatic trimming are not. Demo mode disables upload. Final playlist saving and custom icon resolution still need live verification.
 
 [Official Yoto audio upload workflow](https://yoto.dev/myo/uploading-to-cards/)
 
@@ -120,3 +120,29 @@ Version 0.6.4: existing song previews use playlist image URLs, including chapter
 Version 0.7.0 renames the app to Yoto Playlist Studio. Existing client-ID preferences and backup storage are retained. New MP3s go to Music/Yoto Playlist Studio; repeat imports also search the earlier Music/Yoto Pixel Studio folder.
 
 Custom icon previews now load your personal Yoto icon library (/media/displayIcons/user/me), with a Reload icons action and visible failure details. The new application icon is bundled for Finder and the Dock. Live custom-icon verification remains pending.
+
+## Create a new playlist
+
+Connect to Yoto and choose **New playlist…** in the sidebar. Enter a name and click **Start playlist**. This starts an unsaved local draft, marked **(new)**. Add audio using **Add audio…** or **Public-domain audio…**. After preparing and reviewing the tracks, click **Upload N track(s)**. The app creates the playlist with its first batch of audio in one final save. No empty placeholder is created on Yoto. Unsaved drafts last only for the current app session; closing an audio window keeps completed MP3 files locally. **Refresh** reloads saved playlists without discarding local playlist drafts.
+
+Creation uses Yoto's documented POST /content flow without a cardId; existing playlists still use their own IDs. If the final creation request fails or returns no ID, refresh your library before starting again to check whether the request succeeded. The window prevents an immediate repeat creation request after an uncertain result.
+
+## Public-domain audio
+
+Select an existing playlist or start a new one, then choose **Public-domain audio…**. Browse [Yoto Space's public-domain catalog](https://yoto.space/public-domain). Click a book's **Add to your library** link to load its public share page into a native track-selection screen; this action previews tracks in Playlist Studio rather than immediately adding a card to your account. Alternatively, paste a `https://share.yoto.co/s/…` link and click **Load tracks**.
+
+Select the chapters you want (or choose **All**) and click **Prepare selected track(s)…**. In the audio window, click **Download MP3s**, review the titles and previews, then **Upload N track(s)**. Tracks follow the collection's order. Available source artwork is downloaded, fitted to 16×16, and uploaded along with each selected track. Artwork download failures are shown while leaving the audio usable. Tracks with copied artwork do not receive automatic icon suggestions.
+
+For other sources, use **Add audio… → Public audio files** and paste direct MP3, M4A, AAC, Ogg, Opus, WAV, FLAC, or AIFF file links, one per line. Public audio imports require only FFmpeg and ffprobe; yt-dlp and Deno are needed only for YouTube. Public audio is encoded as stereo 44.1 kHz, 320 kbps MP3; this does not improve source quality. Files remain in **~/Music/Yoto Playlist Studio** after upload or closing. Repeat imports reuse valid local copies, including when Yoto's temporary download signatures have changed.
+
+The embedded catalog has an isolated, nonpersistent browser session. App Yoto credentials are never forwarded to the catalog or media download hosts. The app reads publicly delivered share-page data and imports only the tracks you choose; it does not scrape the catalog in bulk or use a hidden sharing API. Only HTTPS source/redirect URLs are accepted, with local hostnames and literal IP addresses excluded. Individual source files are limited to 512 MB after download; images and share pages to 8 MB. Share links can expire or change format. Refresh/reopen the shared collection if a temporary media URL expires. Sources with no public downloadable audio are rejected. Direct audio links must point to files, not ZIP archives or article pages.
+
+Version 0.8.0: public-domain browser and chapter selection, direct audio links, original artwork copying, permanent MP3 copies and reuse, new playlist drafts and creation with the first audio upload, library refresh, and API contract checks. A real public-domain chapter from *A Child's Garden of Verses* was downloaded with artwork and verified as a 320,000 bps MP3 (516.02 seconds); repeat import reused the retained local file. Final live Yoto upload/creation still requires account verification. No new playlist was written to a live account during these checks.
+
+## Parallel downloads and uploads
+
+The audio window has a **Simultaneous tracks** setting: **1**, **2**, or **3**, defaulting to **3**. This applies to YouTube/public audio downloads and conversion, and to Yoto artwork/audio uploads and processing. Each active download uses its own downloader instance and temporary directory; each queue row displays its own progress. Completed tracks remain in their original queue positions, regardless of completion order.
+
+Download failures do not stop other tracks; Download / retry keeps successful MP3s and retries missing ones. Upload failures let other in-flight tracks finish processing but prevent the final playlist save. Retrying Upload reuses already uploaded artwork and processed audio in the same window. The playlist itself is saved once, after all ready tracks have processed successfully. Cancelling downloads stops active download/conversion work and prevents queued tasks from starting; permanent MP3 copies remain. Choose **1** for sequential work if a source is rate-limiting or you prefer lower resource use. Speed depends on connection, conversion time and Yoto processing.
+
+Version 0.9.0: bounded parallel downloads/conversion and uploads/processing, selectable concurrency, independent row progress and cancellation, successful-work reuse after failures, stable playlist ordering, and separate processing diagnostics for each upload. Concurrency, order, cancellation and partial-failure behavior passed automated checks. The real upload service was exercised concurrently with simulated upload/poll responses; no live account was changed for these tests.

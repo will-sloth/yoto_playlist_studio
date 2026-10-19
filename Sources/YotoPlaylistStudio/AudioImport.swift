@@ -7,6 +7,8 @@ struct PreparedAudio {
     let bytes: Int
     let bitrate: Int
     let directory: URL
+    var artwork: [UInt32]? = nil
+    var artworkWarning: String? = nil
 }
 
 enum AudioImport {
@@ -135,6 +137,57 @@ final class AudioDownloader {
             throw StudioError((text.contains("HTTP Error 403") ? "YouTube refused the audio download. Retry, or update the tools with: brew upgrade yt-dlp deno. Your saved MP3s are kept.\n" : "\(executable.lastPathComponent) could not finish.\n") + text.split(separator: "\n").suffix(5).joined(separator: "\n"))
         }
         return text
+    }
+    func preparePublic(_ track: PublicAudioTrack, archiveDirectory: URL? = nil, progress: @escaping (String) -> Void) async throws -> PreparedAudio {
+        cancelled = false
+        guard let ffmpeg = AudioImport.tool("ffmpeg"), let probe = AudioImport.tool("ffprobe") else {
+            throw StudioError("Install FFmpeg to import public audio: brew install ffmpeg")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("yoto-audio-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            let identity = PublicAudio.stableID(track.url)
+            var artwork: [UInt32]?
+            var artworkWarning: String?
+            if let url = track.artworkURL {
+                progress("Loading the original artwork…")
+                let image = directory.appendingPathComponent("artwork")
+                do {
+                    try await PublicAudio.download(url, to: image, maximumBytes: 8 * 1024 * 1024)
+                    artwork = try PixelArt.importImage(image)
+                } catch { if Task.isCancelled { throw CancellationError() }; artworkWarning = "Original artwork could not be downloaded; audio is still ready." }
+            }
+            func verify(_ file: URL) async throws -> PreparedAudio {
+                let text = try await execute(probe, ["-v", "error", "-show_entries", "stream=codec_name,bit_rate:format=duration", "-of", "json", file.path], directory: directory, logName: "probe-public.json")
+                let result = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? JSON ?? [:]
+                let stream = (result["streams"] as? [JSON] ?? []).first ?? [:]
+                let format = result["format"] as? JSON ?? [:]
+                guard stream["codec_name"] as? String == "mp3", stream["bit_rate"] as? String == "320000",
+                      let duration = Double(format["duration"] as? String ?? ""), duration.isFinite, duration > 0 else {
+                    throw StudioError("The public audio did not pass the MP3 check.")
+                }
+                let bytes = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                guard bytes > 0 else { throw StudioError("The public audio is empty.") }
+                return PreparedAudio(url: file, title: track.title, duration: duration, bytes: bytes, bitrate: 320000, directory: directory, artwork: artwork, artworkWarning: artworkWarning)
+            }
+            for cached in AudioImport.savedCopies(videoID: identity, directory: archiveDirectory) {
+                do { progress("Checking a saved MP3…"); return try await verify(cached) }
+                catch { if Task.isCancelled || cancelled { throw CancellationError() } }
+            }
+            progress("Downloading public audio…")
+            let source = directory.appendingPathComponent("source.audio")
+            try await PublicAudio.download(track.url, to: source)
+            try Task.checkCancellation()
+            guard !cancelled else { throw CancellationError() }
+            progress("Encoding MP3 at 320 kbps…")
+            let output = directory.appendingPathComponent("audio.mp3")
+            _ = try await execute(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-i", source.path, "-vn", "-c:a", "libmp3lame", "-b:a", "320k", "-ar", "44100", "-ac", "2", "-map_metadata", "-1", "-metadata", "title=" + track.title, "-y", output.path], directory: directory, logName: "encode-public.log")
+            progress("Checking and keeping a local copy…")
+            let checked = try await verify(output)
+            let copy = try AudioImport.keepLocalCopy(output, title: track.title, videoID: identity, directory: archiveDirectory)
+            try? FileManager.default.removeItem(at: source)
+            return PreparedAudio(url: copy, title: checked.title, duration: checked.duration, bytes: checked.bytes, bitrate: checked.bitrate, directory: directory, artwork: artwork, artworkWarning: artworkWarning)
+        } catch { try? FileManager.default.removeItem(at: directory); throw error }
     }
     func prepare(_ input: String, progress: @escaping (String) -> Void) async throws -> PreparedAudio {
         let url = try AudioImport.youtubeURL(input)

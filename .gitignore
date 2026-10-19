@@ -1,0 +1,19 @@
+# Build output and packaged applications
+.build/
+.swiftpm/
+DerivedData/
+*.app/
+*.dSYM/
+*.zip
+.DS_Store
+
+# Local credentials and media
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.mp3
+*.m4a
+*.webm
+Backups/

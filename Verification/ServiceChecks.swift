@@ -32,6 +32,23 @@ private final class TransferProbe {
 
 @main struct ServiceChecks {
     @MainActor static func main() async throws {
+        precondition(YotoService.processingFailure(["error": NSNull()]) == nil)
+        precondition(YotoService.processingFailure(["error": "Conversion timed out", "transcodedSha256": NSNull()]) == "Conversion timed out")
+        precondition(YotoService.processingFailure(["error": ["message": "Invalid audio"]]) == "Invalid audio")
+        precondition(YotoService.processingFailure(["error": false]) == nil)
+        print("PASS: processing errors in HTTP 202 bodies are detected, null and false errors ignored")
+        let normalSignIn = try YotoService.authorizationURL(clientID: " public-client ", challenge: "challenge", state: "nonce", staySignedIn: false)
+        let persistentSignIn = try YotoService.authorizationURL(clientID: "public-client", challenge: "challenge", state: "nonce", staySignedIn: true)
+        let normalQuery = URLComponents(url: normalSignIn, resolvingAgainstBaseURL: false)!.queryItems!
+        let persistentQuery = URLComponents(url: persistentSignIn, resolvingAgainstBaseURL: false)!.queryItems!
+        precondition(normalQuery.first { $0.name == "scope" }?.value == "user:content:manage user:content:view user:icons:manage")
+        precondition(persistentQuery.first { $0.name == "scope" }?.value?.contains("offline_access") == true)
+        precondition(normalQuery.first { $0.name == "redirect_uri" }?.value == "http://127.0.0.1:8787/callback")
+        precondition(normalQuery.first { $0.name == "code_challenge_method" }?.value == "S256")
+        for invalid in ["", "https://dashboard.yoto.dev", "Client ID: wrong", "client id"] {
+            do { _ = try YotoService.authorizationURL(clientID: invalid, challenge: "x", state: "x", staySignedIn: true); fatalError("Malformed Client ID accepted") } catch {}
+        }
+        print("PASS: session-only sign-in preserves the earlier scopes, renewable access is optional, PKCE/callback stay intact and malformed Client IDs are rejected before opening the browser")
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [StubYotoProtocol.self]
         let session = URLSession(configuration: config)
@@ -78,6 +95,42 @@ private final class TransferProbe {
         do { _ = try await service.createPlaylist(payload); fatalError("Expected API failure") }
         catch { precondition(error.localizedDescription.contains("Creating the playlist") && error.localizedDescription.contains("Validation detail")) }
         print("PASS: playlist creation failure retains the server reason and creation step")
+        // The sheet can hold an old card while the server normalizes timestamps,
+        // updates artwork or receives another batch. Append to the current tree.
+        var current: JSON = ["cardId": "batch-playlist", "title": "Current title", "updatedAt": "server-1", "metadata": ["author": "Parent"], "content": ["config": ["shuffle": true], "chapters": [["key": "old", "title": "Original", "display": ["icon16x16": "yoto:#original-icon"], "tracks": [["key": "01", "title": "Original", "trackUrl": "yoto:#original-audio"]]]]]]
+        var batchWrites = 0, snapshots: [JSON] = []
+        StubYotoProtocol.handler = { request in
+            if request.httpMethod == "GET" { precondition(request.cachePolicy == .reloadIgnoringLocalCacheData); return (200, ["card": current]) }
+            precondition(request.url?.path == "/content")
+            var bytes = request.httpBody ?? Data()
+            if bytes.isEmpty, let stream = request.httpBodyStream {
+                stream.open(); defer { stream.close() }; var buffer = [UInt8](repeating: 0, count: 4096)
+                while true { let count = stream.read(&buffer, maxLength: buffer.count); if count <= 0 { break }; bytes.append(contentsOf: buffer.prefix(count)) }
+            }
+            current = try JSONSerialization.jsonObject(with: bytes) as! JSON
+            batchWrites += 1; current["updatedAt"] = "normalized-\(batchWrites)"
+            return (200, ["card": current])
+        }
+        let batchTrack: JSON = ["transcodedSha256": "new-audio", "transcodedInfo": ["duration": 2, "fileSize": 100, "format": "mp3"]]
+        _ = try await service.appendAudioBatch([(batchTrack, "Batch one A"), (batchTrack, "Batch one B")], artwork: [1: "yoto:#new-art"], to: "batch-playlist") { snapshots.append($0) }
+        // Simulate a background edit between batches, while the UI has old state.
+        var currentContent = current["content"] as! JSON
+        var currentChapters = currentContent["chapters"] as! [JSON]
+        var originalDisplay = currentChapters[0]["display"] as! JSON
+        originalDisplay["icon16x16"] = "yoto:#edited-icon"; currentChapters[0]["display"] = originalDisplay
+        currentChapters.append(["key": "external", "title": "Added elsewhere", "tracks": [["key": "01", "title": "Added elsewhere", "trackUrl": "yoto:#external"]]])
+        currentContent["chapters"] = currentChapters; current["content"] = currentContent; current["updatedAt"] = "background-edit"
+        _ = try await service.appendAudioBatch([(batchTrack, "Batch two")], to: "batch-playlist") { snapshots.append($0) }
+        precondition(batchWrites == 2 && snapshots.count == 2)
+        precondition(CardEditor.rows(current).map(\.title) == ["Original", "Batch one A", "Batch one B", "Added elsewhere", "Batch two"])
+        precondition(CardEditor.rows(current)[0].icon == "yoto:#edited-icon" && CardEditor.rows(current)[2].icon == "yoto:#new-art")
+        precondition(CardEditor.rows(snapshots[1]).count == 4 && snapshots[1]["updatedAt"] as? String == "background-edit")
+        precondition(((current["content"] as! JSON)["config"] as! JSON)["shuffle"] as? Bool == true)
+        do {
+            _ = try await service.appendAudioBatch([(batchTrack, "Must not save")], to: "batch-playlist") { _ in throw StudioError("Backup unavailable") }
+            fatalError("Backup failure must block save")
+        } catch { precondition(batchWrites == 2) }
+        print("PASS: consecutive audio batches append without reopening, preserve intervening tracks/artwork/settings despite changed timestamps, back up current content, and block writes if backup fails")
         let probe = TransferProbe()
         StubYotoProtocol.delay = 0.03
         StubYotoProtocol.finished = { probe.finish() }
@@ -117,6 +170,19 @@ private final class TransferProbe {
         precondition(Set(hashes.compactMap { $0 }).count == 4)
         precondition(probe.peak == 2 && probe.puts == 4 && probe.active == 0)
         StubYotoProtocol.delay = 0; StubYotoProtocol.finished = nil
+        StubYotoProtocol.handler = { request in
+            if request.url?.path == "/media/transcode/audio/uploadUrl" {
+                return (200, ["upload": ["uploadId": "failed-processing-fixture", "uploadUrl": NSNull()]])
+            }
+            return (202, ["transcode": ["error": ["message": "Conversion timed out"], "transcodedSha256": NSNull()]])
+        }
+        do {
+            _ = try await service.uploadAudio(directory.appendingPathComponent("track-0.mp3")) { _ in }
+            fatalError("HTTP 202 conversion errors must fail immediately")
+        } catch {
+            precondition(error.localizedDescription.contains("Conversion timed out"))
+        }
+        print("PASS: upload polling surfaces the server's conversion error from HTTP 202 without waiting for timeout")
         print("PASS: real upload service overlaps two signed uploads and processing polls, keeps results distinct, and never forwards Yoto authorization to storage (simulated responses)")
     }
 }

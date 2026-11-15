@@ -2,6 +2,10 @@ import SwiftUI
 import AVFoundation
 import UniformTypeIdentifiers
 
+enum AudioInputSource: String, CaseIterable {
+    case youtube = "YouTube / SoundCloud", publicAudio = "Public audio files", localMP3 = "Local MP3s"
+}
+
 struct AudioQueueItem: Identifiable {
     let id = UUID()
     let link: URL
@@ -23,10 +27,10 @@ struct AudioImportSheet: View {
     let onSaved: (JSON) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var links = ""
-    @State private var directAudio = false
+    @State private var source = AudioInputSource.youtube
     @State private var queue: [AudioQueueItem] = []
     @State private var missing = AudioImport.missingTools
-    @State private var message = "Paste one YouTube video link per line. Duplicate links are skipped."
+    @State private var message = "Paste one YouTube or SoundCloud track link per line. Duplicate links are skipped."
     @State private var failure: String?
     @State private var working = false
     @State private var uploading = false
@@ -36,7 +40,15 @@ struct AudioImportSheet: View {
     @State private var task: Task<Void, Never>?
     @State private var downloaders: [Int: AudioDownloader] = [:]
     @State private var parallelLimit = 3
-    private var relevantMissingTools: [String] { (directAudio || !initialTracks.isEmpty) ? missing.filter { ["ffmpeg", "ffprobe"].contains($0) } : missing }
+    @State private var showingTrimPrompt = false
+    private var relevantMissingTools: [String] {
+        if source == .localMP3 { return missing.filter { $0 == "ffprobe" } }
+        if source == .youtube && initialTracks.isEmpty,
+           let urls = try? AudioImport.mediaURLs(links), urls.allSatisfy({ $0.host == "soundcloud.com" }) {
+            return missing.filter { $0 != "deno" }
+        }
+        return (source == .publicAudio || !initialTracks.isEmpty) ? missing.filter { ["ffmpeg", "ffprobe"].contains($0) } : missing
+    }
     private var ready: [AudioQueueItem] { queue.filter { $0.audio != nil } }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -44,11 +56,16 @@ struct AudioImportSheet: View {
             if createsPlaylist { Text("New playlist — saved to Yoto after the first audio upload").font(.caption).foregroundStyle(.secondary) }
             Text("Destination: \(card["title"] as? String ?? "Playlist")\(isDemo ? " (demo — upload disabled)" : "")").font(.callout).foregroundStyle(.secondary)
             if initialTracks.isEmpty {
-                Picker("Audio source", selection: $directAudio) { Text("YouTube").tag(false); Text("Public audio files").tag(true) }.pickerStyle(.segmented).disabled(working)
-                Text(directAudio ? "Direct audio-file links — one per line" : "YouTube video links — one per line").font(.caption.bold())
+                Picker("Audio source", selection: $source) { ForEach(AudioInputSource.allCases, id: \.self) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).disabled(working)
+                if source == .localMP3 {
+                    HStack {
+                        Button("Choose MP3 files…") { chooseLocalFiles() }.disabled(working || committed)
+                        Text("Select one or more files. Originals stay unchanged.").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else { Text(source == .publicAudio ? "Direct audio-file links — one per line" : "YouTube or SoundCloud track links — one per line").font(.caption.bold()) }
             } else { Text("\(initialTracks.count) selected public audio tracks").font(.headline) }
-            if initialTracks.isEmpty { TextEditor(text: $links).font(.system(.callout, design: .monospaced)).frame(height: 85).padding(6).background(Color(nsColor: .textBackgroundColor)).overlay(RoundedRectangle(cornerRadius: 6).stroke(.gray.opacity(0.3))).disabled(working) }
-            Text("Best available source → 320 kbps MP3. This cannot improve source quality. Yoto processes uploaded audio and may use a different final bitrate.").font(.caption).foregroundStyle(.secondary)
+            if initialTracks.isEmpty && source != .localMP3 { TextEditor(text: $links).font(.system(.callout, design: .monospaced)).frame(height: 85).padding(6).background(Color(nsColor: .textBackgroundColor)).overlay(RoundedRectangle(cornerRadius: 6).stroke(.gray.opacity(0.3))).disabled(working) }
+            Text(source == .localMP3 ? "Local MP3s keep their original quality. A separate copy is saved before upload. Yoto processes the audio for playback." : "Best available source → 320 kbps MP3. This cannot improve source quality. Yoto processes uploaded audio and may use a different final bitrate.").font(.caption).foregroundStyle(.secondary)
             HStack {
                 Text("Simultaneous tracks").font(.caption)
                 Picker("Simultaneous tracks", selection: $parallelLimit) { Text("1").tag(1); Text("2").tag(2); Text("3").tag(3) }.labelsHidden().pickerStyle(.segmented).frame(width: 150).disabled(working)
@@ -58,7 +75,7 @@ struct AudioImportSheet: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("Tools needed: " + relevantMissingTools.joined(separator: ", ")).font(.caption.bold())
-                        Text("brew install yt-dlp ffmpeg deno").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text(source == .youtube && initialTracks.isEmpty ? "brew install yt-dlp ffmpeg deno" : "brew install ffmpeg").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                     }
                     Spacer()
                     Link("Setup guide ↗", destination: URL(string: "https://github.com/yt-dlp/yt-dlp#installation")!)
@@ -75,12 +92,12 @@ struct AudioImportSheet: View {
                                     if let pixels = audio.artwork { HStack { Image(nsImage: PixelArt.image(pixels)).resizable().interpolation(.none).frame(width: 28, height: 28); Text("Original artwork included").font(.caption) } }
                                     TextField("Track title", text: $item.title).textFieldStyle(.roundedBorder).disabled(working)
                                     HStack {
-                                        Text(String(format: "MP3 · 320 kbps · %.0f:%02.0f · %.1f MB", floor(audio.duration / 60), audio.duration.truncatingRemainder(dividingBy: 60), Double(audio.bytes) / 1_000_000)).font(.caption)
+                                        Text(String(format: "MP3 · %@ · %.0f:%02.0f · %.1f MB", audio.bitrate > 0 ? "\(audio.bitrate / 1000) kbps" : "original quality", floor(audio.duration / 60), audio.duration.truncatingRemainder(dividingBy: 60), Double(audio.bytes) / 1_000_000)).font(.caption)
                                         Spacer()
                                         Button("Preview") { play(audio) }
                                         Button("Save MP3…") { export(audio, title: item.title) }
                                     }.disabled(uploading)
-                                } else { Text(item.publicSource?.title ?? item.link.absoluteString).font(.caption).lineLimit(2) }
+                                } else { Text(item.publicSource?.title ?? (item.link.isFileURL ? item.link.lastPathComponent : item.link.absoluteString)).font(.caption).lineLimit(2) }
                                 Text(item.error ?? item.message).font(.caption2).foregroundStyle(item.error == nil ? Color.secondary : Color.red).textSelection(.enabled)
                             }.padding(10).background(Color(nsColor: .controlBackgroundColor)).cornerRadius(8)
                         }
@@ -90,24 +107,31 @@ struct AudioImportSheet: View {
             if working { HStack { ProgressView().controlSize(.small); Text(message).font(.callout) } }
             else { Text(message).font(.caption).foregroundStyle(.secondary) }
             if let failure { Text(failure).font(.caption).foregroundStyle(.red).textSelection(.enabled).lineLimit(6) }
-            Text("MP3 copies stay in Music/Yoto Playlist Studio after closing or uploading. Upload appends the ready tracks together at the end. Existing audio and artwork are kept. Failed downloads are skipped; you can retry them before uploading.").font(.caption).foregroundStyle(.secondary)
+            Text("MP3 copies stay in Music/Yoto Playlist Studio after closing or uploading. Upload appends ready tracks at the end. Existing audio and artwork are kept. Failed imports are skipped; retry them before uploading.").font(.caption).foregroundStyle(.secondary)
             HStack {
-                Button(working ? "Cancel downloads" : "Close") { task?.cancel(); cancelDownloads(); dismiss() }.disabled(uploading)
+                Button(working ? "Cancel preparation" : "Close") { task?.cancel(); cancelDownloads(); dismiss() }.disabled(uploading)
                 Button("Open local copies") {
                     do { try FileManager.default.createDirectory(at: AudioImport.archiveDirectory, withIntermediateDirectories: true); NSWorkspace.shared.open(AudioImport.archiveDirectory) }
                     catch { failure = "Could not open the local audio folder: " + error.localizedDescription }
                 }
                 if !queue.isEmpty { Button("Stop preview") { player?.stop() } }
                 Spacer()
-                Button(queue.contains(where: { $0.audio != nil || $0.error != nil }) ? "Download / retry" : "Download MP3s") { downloadAll() }.disabled(working || relevantMissingTools.count > 0 || (initialTracks.isEmpty && links.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) || committed)
+                Button(source == .localMP3 ? "Prepare / retry MP3s" : (queue.contains(where: { $0.audio != nil || $0.error != nil }) ? "Download / retry" : "Download MP3s")) { downloadAll() }.disabled(working || relevantMissingTools.count > 0 || (initialTracks.isEmpty && (source == .localMP3 ? queue.isEmpty : links.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)) || committed)
                 Button("Upload \(ready.count) track(s)") { upload() }.buttonStyle(.borderedProminent).disabled(working || ready.isEmpty || ready.contains(where: { $0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) || isDemo || committed || creationUncertain)
             }
         }.padding(26).frame(width: 700)
+        .alert("Audio exceeds Yoto’s two-hour limit", isPresented: $showingTrimPrompt) {
+            Button("Trim and upload") { upload(trimLongAudio: true) }
+            Button("Abort", role: .cancel) { message = "Upload aborted. Your full MP3 copies are kept." }
+        } message: {
+            let titles = queue.filter { ($0.audio?.duration ?? 0) > 7200 }.map(\.title).joined(separator: "\n")
+            Text("\(titles)\n\nKeep only the first 1 hour, 59 minutes, 59 seconds of each oversized track? The ending will be removed from the upload copy. Full originals stay saved locally. Abort leaves the playlist unchanged.")
+        }
         .interactiveDismissDisabled(uploading)
         .onAppear {
             if !initialTracks.isEmpty { queue = initialTracks.map { AudioQueueItem(link: $0.url, publicSource: $0) }; message = "Review the selected tracks, then download MP3s." }
         }
-        .onChange(of: directAudio) { _ in if !working { cleanup(); queue = []; failure = nil; message = directAudio ? "Paste direct audio-file links, one per line." : "Paste YouTube links, one per line." } }
+        .onChange(of: source) { _ in if !working { cleanup(); queue = []; failure = nil; message = source == .localMP3 ? "Choose MP3 files, then prepare them for upload." : source == .publicAudio ? "Paste direct audio-file links, one per line." : "Paste YouTube or SoundCloud links, one per line." } }
         .onDisappear { task?.cancel(); cancelDownloads(); player?.stop(); cleanup() }
         .onChange(of: links) { _ in
             if !working { player?.stop(); cleanup(); queue = []; failure = nil }
@@ -130,15 +154,29 @@ struct AudioImportSheet: View {
         do { try Data(contentsOf: audio.url, options: .mappedIfSafe).write(to: url, options: .atomic) }
         catch { failure = "Could not save the MP3: " + error.localizedDescription }
     }
+    private func chooseLocalFiles() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.mp3]; panel.allowsMultipleSelection = true; panel.canChooseDirectories = false
+        panel.message = "Select MP3 files to add to this playlist. Original files will be kept."
+        guard panel.runModal() == .OK else { return }
+        player?.stop()
+        var seen = Set(queue.map { $0.link.standardizedFileURL.resolvingSymlinksInPath() })
+        for file in panel.urls where seen.insert(file.standardizedFileURL.resolvingSymlinksInPath()).inserted {
+            queue.append(AudioQueueItem(link: file))
+        }
+        failure = nil; message = "\(queue.count) local MP3(s) selected. Prepare them, then review before uploading."
+    }
     private func downloadAll() {
         do {
             if !initialTracks.isEmpty {
                 if queue.isEmpty { queue = initialTracks.map { AudioQueueItem(link: $0.url, publicSource: $0) } }
-            } else if directAudio {
+            } else if source == .localMP3 {
+                guard !queue.isEmpty else { throw StudioError("Choose MP3 files first.") }
+            } else if source == .publicAudio {
                 let tracks = try PublicAudio.directTracks(links)
                 if queue.map(\.link) != tracks.map(\.url) { cleanup(); queue = tracks.map { AudioQueueItem(link: $0.url, publicSource: $0) } }
             } else {
-                let urls = try AudioImport.youtubeURLs(links)
+                let urls = try AudioImport.mediaURLs(links)
                 if queue.map(\.link) != urls { cleanup(); queue = urls.map { AudioQueueItem(link: $0) } }
             }
         } catch { failure = error.localizedDescription; return }
@@ -156,7 +194,8 @@ struct AudioImportSheet: View {
                 do {
                     let progress: (String) -> Void = { stage in queue[index].message = stage }
                     let result: PreparedAudio
-                    if let source = queue[index].publicSource { result = try await downloader.preparePublic(source, progress: progress) }
+                    if queue[index].link.isFileURL { result = try await downloader.prepareLocal(queue[index].link, progress: progress) }
+                    else if let source = queue[index].publicSource { result = try await downloader.preparePublic(source, progress: progress) }
                     else { result = try await downloader.prepare(queue[index].link.absoluteString, progress: progress) }
                     guard !Task.isCancelled else { try? FileManager.default.removeItem(at: result.directory); return }
                     queue[index].audio = result; queue[index].title = result.title
@@ -165,20 +204,39 @@ struct AudioImportSheet: View {
                     if Task.isCancelled { return }
                     queue[index].error = error.localizedDescription
                 }
-                message = "\(completed + 1)/\(indices.count) downloads finished · up to \(parallelLimit) at once"
+                message = "\(completed + 1)/\(indices.count) tracks prepared · up to \(parallelLimit) at once"
             }
-            message = "\(ready.count)/\(queue.count) downloaded. Review titles and previews, then upload the ready tracks together."
+            message = "\(ready.count)/\(queue.count) ready. Review titles and previews, then upload the ready tracks together."
         }
     }
-    private func upload() {
+    private func upload(trimLongAudio: Bool = false) {
         guard !ready.isEmpty else { return }
+        if !trimLongAudio && ready.contains(where: { ($0.audio?.duration ?? 0) > 7200 }) {
+            showingTrimPrompt = true
+            return
+        }
         working = true; uploading = true; failure = nil; player?.stop()
         task = Task { @MainActor in
             defer { working = false; uploading = false }
             do {
+                if trimLongAudio {
+                    for index in queue.indices where (queue[index].audio?.duration ?? 0) > 7200 {
+                        guard let audio = queue[index].audio else { continue }
+                        let downloader = AudioDownloader()
+                        downloaders[index] = downloader
+                        defer { downloaders.removeValue(forKey: index) }
+                        queue[index].message = "Trimming a copy to fit Yoto…"
+                        let trimmed = try await downloader.trim(audio)
+                        queue[index].audio = trimmed
+                        queue[index].transcode = nil
+                        queue[index].error = nil
+                        queue[index].message = "Trimmed copy ready · full original kept"
+                    }
+                }
                 guard let id = card["cardId"] as? String else { throw StudioError("Choose an existing playlist first.") }
-                let fresh = createsPlaylist ? card : try await service.card(id)
-                if !createsPlaylist { guard try sameCard(fresh, card) else { throw StudioError("This playlist changed. Close and reopen it before uploading.") } }
+                // A new batch appends to the latest server playlist, not the snapshot
+                // captured when this sheet opened. Check access before transferring files.
+                if !createsPlaylist { _ = try await service.card(id) }
                 let indices = queue.indices.filter { queue[$0].audio != nil }
                 message = "Uploading and processing \(indices.count) track(s), up to \(parallelLimit) at once…"
                 await ParallelAudio.run(indices: indices, limit: parallelLimit) { index in
@@ -196,30 +254,37 @@ struct AudioImportSheet: View {
                 }
                 try Task.checkCancellation()
                 let failed = indices.filter { queue[$0].error != nil || queue[$0].transcode == nil }
-                guard failed.isEmpty else { throw StudioError("\(failed.count) track upload(s) failed. No tracks were appended. Retry Upload to reuse the tracks already processed by Yoto.") }
-                let latest = createsPlaylist ? fresh : try await service.card(id)
-                if !createsPlaylist { guard try sameCard(latest, fresh) else { throw StudioError("The playlist changed during upload. No batch tracks were appended. Close and reload before retrying.") } }
+                guard failed.isEmpty else {
+                    let details = failed.prefix(3).map { index in
+                        "\(queue[index].title): \(queue[index].error ?? "Audio processing is incomplete.")"
+                    }.joined(separator: "\n")
+                    throw StudioError("\(failed.count) track upload(s) failed. No tracks were appended.\n\(details)\nRetry Upload to reuse tracks already processed by Yoto.")
+                }
                 let tracks = try indices.map { index -> (transcode: JSON, title: String) in
                     guard let transcode = queue[index].transcode else { throw StudioError("Audio processing is incomplete.") }
                     return (transcode, queue[index].title)
                 }
-                var payload = try AudioImport.appendBatch(tracks, to: latest)
-                let firstNewChapter = ((latest["content"] as? JSON)?["chapters"] as? [JSON] ?? []).count
-                var artwork: [String: String] = [:]
-                for (position, index) in indices.enumerated() { if let icon = queue[index].uploadedIcon { artwork["\(firstNewChapter + position):0"] = icon } }
-                if !artwork.isEmpty { payload = try CardEditor.applying(artwork, to: payload) }
+                let artwork = Dictionary(uniqueKeysWithValues: indices.enumerated().compactMap { position, index in
+                    queue[index].uploadedIcon.map { (position, $0) }
+                })
                 let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("YotoPixelStudio/Backups", isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                try JSONSerialization.data(withJSONObject: latest, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("audio-import-" + UUID().uuidString + ".json"), options: .atomic)
+                let backup: (JSON) throws -> Void = { latest in
+                    try JSONSerialization.data(withJSONObject: latest, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("audio-import-" + UUID().uuidString + ".json"), options: .atomic)
+                }
                 message = "Adding \(tracks.count) tracks to your playlist…"
                 let saved: JSON
                 if createsPlaylist {
+                    var payload = try AudioImport.appendBatch(tracks, to: card)
+                    let references = Dictionary(uniqueKeysWithValues: artwork.map { ("\($0.key):0", $0.value) })
+                    if !references.isEmpty { payload = try CardEditor.applying(references, to: payload) }
+                    try backup(card)
                     payload.removeValue(forKey: "cardId")
                     message = "Creating your new playlist…"
                     creationUncertain = true
                     saved = try await service.createPlaylist(payload)
                     creationUncertain = false
-                } else { saved = try await service.save(payload) }
+                } else { saved = try await service.appendAudioBatch(tracks, artwork: artwork, to: id, backup: backup) }
                 committed = true
                 cleanup()
                 let savedID = saved["cardId"] as? String ?? id
@@ -227,8 +292,5 @@ struct AudioImportSheet: View {
                 onSaved(refreshed); dismiss()
             } catch { failure = error.localizedDescription + (creationUncertain ? " Close this window and refresh your playlists before starting again, to avoid creating a duplicate." : "") }
         }
-    }
-    private func sameCard(_ lhs: JSON, _ rhs: JSON) throws -> Bool {
-        try JSONSerialization.data(withJSONObject: lhs["content"] ?? [:], options: [.sortedKeys]) == JSONSerialization.data(withJSONObject: rhs["content"] ?? [:], options: [.sortedKeys]) && (lhs["updatedAt"] as? String) == (rhs["updatedAt"] as? String)
     }
 }

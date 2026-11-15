@@ -45,6 +45,40 @@ enum AudioImport {
         var seen = Set<String>()
         return try parts.map { try youtubeURL($0) }.filter { seen.insert($0.absoluteString).inserted }
     }
+    static func mediaURL(_ input: String) throws -> URL {
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let host = URL(string: value)?.host?.lowercased(), ["soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"].contains(host) {
+            return try soundcloudURL(value)
+        }
+        return try youtubeURL(value)
+    }
+    static func soundcloudURL(_ input: String) throws -> URL {
+        guard let url = URL(string: input.trimmingCharacters(in: .whitespacesAndNewlines)), url.scheme == "https",
+              url.user == nil, url.password == nil, url.port == nil,
+              ["soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"].contains(url.host?.lowercased() ?? "") else {
+            throw StudioError("Enter a full HTTPS SoundCloud track link, such as soundcloud.com/artist/track.")
+        }
+        let parts = url.path.split(separator: "/").map(String.init)
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        guard !(URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath.contains("%") ?? true),
+              !url.path.contains("//"), parts.count == 2, parts.allSatisfy({ !$0.isEmpty && $0.unicodeScalars.allSatisfy(allowed.contains) }),
+              !["sets", "tracks", "albums", "likes", "reposts", "popular-tracks"].contains(parts[1]),
+              !["discover", "search", "charts", "you", "stream", "stations"].contains(parts[0]),
+              !(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "secret_token" } ?? false) else {
+            throw StudioError("Choose a public SoundCloud track link, not a profile, set, private link or playlist.")
+        }
+        return URL(string: "https://soundcloud.com/" + parts.joined(separator: "/"))!
+    }
+    static func mediaURLs(_ input: String) throws -> [URL] {
+        let parts = input.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        guard !parts.isEmpty else { throw StudioError("Paste one YouTube or SoundCloud track link per line.") }
+        var seen = Set<String>()
+        return try parts.map { try mediaURL($0) }.filter { seen.insert($0.absoluteString).inserted }
+    }
+    static func mediaID(_ url: URL) -> String {
+        if url.host == "soundcloud.com" { return "soundcloud-" + PublicAudio.stableID(url) }
+        return URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "v" })?.value ?? PublicAudio.stableID(url)
+    }
     static func appendBatch(_ tracks: [(transcode: JSON, title: String)], to card: JSON) throws -> JSON {
         guard !tracks.isEmpty else { throw StudioError("Download at least one track first.") }
         return try tracks.reduce(card) { try append(transcode: $1.transcode, title: $1.title, to: $0) }
@@ -134,9 +168,69 @@ final class AudioDownloader {
         let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
         guard code == 0 else {
             // Last lines help diagnose extractor/tool errors without collecting browser credentials.
-            throw StudioError((text.contains("HTTP Error 403") ? "YouTube refused the audio download. Retry, or update the tools with: brew upgrade yt-dlp deno. Your saved MP3s are kept.\n" : "\(executable.lastPathComponent) could not finish.\n") + text.split(separator: "\n").suffix(5).joined(separator: "\n"))
+            throw StudioError((text.contains("HTTP Error 403") ? "The audio source refused the download after retrying with a fresh link. Try again later, or use a direct audio link. Your saved MP3s are kept.\n" : "\(executable.lastPathComponent) could not finish.\n") + text.split(separator: "\n").suffix(5).joined(separator: "\n"))
         }
         return text
+    }
+    func prepareLocal(_ file: URL, archiveDirectory: URL? = nil, progress: @escaping (String) -> Void) async throws -> PreparedAudio {
+        cancelled = false
+        guard file.isFileURL, file.pathExtension.lowercased() == "mp3" else { throw StudioError("Choose a local MP3 file.") }
+        guard let probe = AudioImport.tool("ffprobe") else { throw StudioError("Install FFmpeg to check local audio: brew install ffmpeg") }
+        let accessed = file.startAccessingSecurityScopedResource()
+        defer { if accessed { file.stopAccessingSecurityScopedResource() } }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("yoto-local-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            guard try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else { throw StudioError("Choose a regular MP3 file.") }
+            progress("Copying local MP3…")
+            let copy = directory.appendingPathComponent("source.mp3")
+            try FileManager.default.copyItem(at: file, to: copy)
+            progress("Checking local MP3…")
+            let text = try await execute(probe, ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name,bit_rate:format=duration,bit_rate:format_tags=title", "-of", "json", copy.path], directory: directory, logName: "probe.json")
+            let info = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? JSON ?? [:]
+            let stream = (info["streams"] as? [JSON])?.first ?? [:]
+            let format = info["format"] as? JSON ?? [:]
+            let bytes = try copy.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard stream["codec_name"] as? String == "mp3", bytes > 0,
+                  let duration = Double(format["duration"] as? String ?? ""), duration.isFinite, duration > 0 else {
+                throw StudioError("This file is not a readable MP3 with a valid duration. Your original file is unchanged.")
+            }
+            let tag = ((format["tags"] as? JSON)?["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = tag.isEmpty ? file.deletingPathExtension().lastPathComponent : tag
+            let bitrate = Int(stream["bit_rate"] as? String ?? format["bit_rate"] as? String ?? "") ?? 0
+            try Task.checkCancellation()
+            guard !cancelled else { throw CancellationError() }
+            let saved = try AudioImport.keepLocalCopy(copy, title: title, videoID: PublicAudio.stableID(file), directory: archiveDirectory)
+            try FileManager.default.removeItem(at: copy)
+            return PreparedAudio(url: saved, title: title, duration: duration, bytes: bytes, bitrate: bitrate, directory: directory)
+        } catch { try? FileManager.default.removeItem(at: directory); throw error }
+    }
+    func trim(_ audio: PreparedAudio, maximumDuration: Double = 7199, archiveDirectory: URL? = nil) async throws -> PreparedAudio {
+        guard maximumDuration > 0, maximumDuration < 7200, maximumDuration.isFinite,
+              let ffmpeg = AudioImport.tool("ffmpeg"), let probe = AudioImport.tool("ffprobe") else {
+            throw StudioError("Install FFmpeg to trim audio. Your original MP3 is kept.")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("yoto-trim-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            let output = directory.appendingPathComponent("trimmed.mp3")
+            // MP3 frame copying avoids quality loss and keeps trimming fast.
+            _ = try await execute(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-i", audio.url.path, "-t", String(maximumDuration), "-map", "0:a:0", "-c:a", "copy", "-y", output.path], directory: directory, logName: "trim.log")
+            let text = try await execute(probe, ["-v", "error", "-show_entries", "stream=codec_name,bit_rate:format=duration", "-of", "json", output.path], directory: directory, logName: "probe.json")
+            let info = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? JSON ?? [:]
+            let stream = (info["streams"] as? [JSON])?.first ?? [:]
+            guard let format = info["format"] as? JSON, let duration = Double(format["duration"] as? String ?? ""),
+                  duration.isFinite, duration > 0, duration < 7200, duration <= maximumDuration + 0.1,
+                  stream["codec_name"] as? String == "mp3" else {
+                throw StudioError("The trimmed MP3 did not pass verification. Your original is kept; nothing was uploaded.")
+            }
+            try Task.checkCancellation()
+            guard !cancelled else { throw CancellationError() }
+            let copy = try AudioImport.keepLocalCopy(output, title: audio.title + " (trimmed)", videoID: PublicAudio.stableID(audio.url) + "-trim", directory: archiveDirectory)
+            let bytes = try copy.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            try? FileManager.default.removeItem(at: directory)
+            return PreparedAudio(url: copy, title: audio.title, duration: duration, bytes: bytes, bitrate: Int(stream["bit_rate"] as? String ?? "") ?? audio.bitrate, directory: audio.directory, artwork: audio.artwork, artworkWarning: audio.artworkWarning)
+        } catch { try? FileManager.default.removeItem(at: directory); throw error }
     }
     func preparePublic(_ track: PublicAudioTrack, archiveDirectory: URL? = nil, progress: @escaping (String) -> Void) async throws -> PreparedAudio {
         cancelled = false
@@ -189,12 +283,13 @@ final class AudioDownloader {
             return PreparedAudio(url: copy, title: checked.title, duration: checked.duration, bytes: checked.bytes, bitrate: checked.bitrate, directory: directory, artwork: artwork, artworkWarning: artworkWarning)
         } catch { try? FileManager.default.removeItem(at: directory); throw error }
     }
-    func prepare(_ input: String, progress: @escaping (String) -> Void) async throws -> PreparedAudio {
-        let url = try AudioImport.youtubeURL(input)
+    func prepare(_ input: String, archiveDirectory: URL? = nil, progress: @escaping (String) -> Void) async throws -> PreparedAudio {
+        let url = try AudioImport.mediaURL(input)
+        let isYouTube = url.host != "soundcloud.com"
         cancelled = false
-        let videoID = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "v" })?.value ?? ""
+        let videoID = AudioImport.mediaID(url)
         if let probe = AudioImport.tool("ffprobe") {
-            for file in AudioImport.savedCopies(videoID: videoID) {
+            for file in AudioImport.savedCopies(videoID: videoID, directory: archiveDirectory) {
                 let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("yoto-audio-" + UUID().uuidString)
                 try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
                 do {
@@ -215,8 +310,8 @@ final class AudioDownloader {
                 }
             }
         }
-        guard AudioImport.missingTools.isEmpty,
-              let downloader = AudioImport.tool("yt-dlp"), let ffmpeg = AudioImport.tool("ffmpeg"), let probe = AudioImport.tool("ffprobe"), let deno = AudioImport.tool("deno") else {
+        guard let downloader = AudioImport.tool("yt-dlp"), let ffmpeg = AudioImport.tool("ffmpeg"), let probe = AudioImport.tool("ffprobe"),
+              !isYouTube || AudioImport.tool("deno") != nil else {
             throw StudioError("Install the audio tools shown in this window, then click Check tools.")
         }
         cancelled = false
@@ -224,10 +319,29 @@ final class AudioDownloader {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
             progress("Downloading the best available source audio…")
-            _ = try await execute(downloader, ["--ignore-config", "--no-plugin-dirs", "--no-playlist", "--no-progress", "--no-warnings", "--match-filter", "!is_live", "--socket-timeout", "30", "--retries", "3", "--js-runtimes", "deno:" + deno.path, "--check-formats", "--format", "bestaudio", "--write-info-json", "--output", "source.%(ext)s", "--", url.absoluteString], directory: directory, logName: "download.log")
+            // A 403 can be transient or caused by a stale signed media URL. Run a
+            // fresh extraction once, and never reuse partial data from that attempt.
+            var arguments = ["--ignore-config", "--no-plugin-dirs", "--no-playlist", "--no-progress", "--no-warnings", "--match-filter", "!is_live", "--socket-timeout", "30", "--retries", "3", "--check-formats", "--format", "bestaudio", "--write-info-json", "--output", "source.%(ext)s", "--", url.absoluteString]
+            if isYouTube, let deno = AudioImport.tool("deno") { arguments.insert(contentsOf: ["--js-runtimes", "deno:" + deno.path], at: 0) }
+            for attempt in 0..<2 {
+                do {
+                    _ = try await execute(downloader, arguments, directory: directory, logName: "download-\(attempt + 1).log")
+                    break
+                } catch {
+                    guard attempt == 0, !cancelled, !Task.isCancelled,
+                          let log = try? String(contentsOf: directory.appendingPathComponent("download-1.log"), encoding: .utf8),
+                          log.contains("HTTP Error 403") else { throw error }
+                    progress("The source refused the link. Getting a fresh download link…")
+                    for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                        where file.lastPathComponent.hasPrefix("source.") {
+                        try FileManager.default.removeItem(at: file)
+                    }
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+            }
             let infoURL = directory.appendingPathComponent("source.info.json")
             let info = try JSONSerialization.jsonObject(with: Data(contentsOf: infoURL)) as? JSON ?? [:]
-            let title = info["title"] as? String ?? "YouTube audio"
+            let title = info["title"] as? String ?? "Audio"
             let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             guard let source = files.first(where: { $0.lastPathComponent.hasPrefix("source.") && !["json", "part", "ytdl"].contains($0.pathExtension) }) else { throw StudioError("The downloader produced no audio file.") }
             progress("Encoding MP3 at 320 kbps…")
@@ -242,8 +356,7 @@ final class AudioDownloader {
                   let duration = Double(format["duration"] as? String ?? ""), duration.isFinite, duration > 0 else { throw StudioError("The encoded MP3 did not pass the 320 kbps audio check.") }
             let bytes = try output.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             guard bytes > 0 else { throw StudioError("The downloaded audio is empty.") }
-            let videoID = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "v" })?.value ?? UUID().uuidString
-            let localCopy = try AudioImport.keepLocalCopy(output, title: title, videoID: videoID)
+            let localCopy = try AudioImport.keepLocalCopy(output, title: title, videoID: videoID, directory: archiveDirectory)
             try? FileManager.default.removeItem(at: source)
             return PreparedAudio(url: localCopy, title: title, duration: duration, bytes: bytes, bitrate: bitrate, directory: directory)
         } catch { try? FileManager.default.removeItem(at: directory); throw error }

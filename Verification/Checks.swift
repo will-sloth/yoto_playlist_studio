@@ -193,6 +193,16 @@ XCTAssertEqual(AudioImport.savedCopies(videoID: "video", directory: archiveTest.
 XCTAssertEqual(AudioImport.savedCopies(videoID: "other", directory: archiveTest.appendingPathComponent("archive")).count, 0)
 try FileManager.default.removeItem(at: archiveTest)
 print("PASS: permanent audio copies survive source cleanup, safe filenames and non-overwriting repeat downloads")
+let sc = try AudioImport.mediaURL("https://www.soundcloud.com/simonschuster/silly-lullaby-keith-boynton?utm_source=test")
+XCTAssertEqual(sc.absoluteString, "https://soundcloud.com/simonschuster/silly-lullaby-keith-boynton")
+XCTAssertEqual(try AudioImport.mediaURLs(sc.absoluteString + "\n" + sc.absoluteString + "?utm_source=share\nhttps://youtu.be/pZw9veQ76fo").count, 2)
+XCTAssertEqual(AudioImport.mediaID(sc), AudioImport.mediaID(try AudioImport.mediaURL(sc.absoluteString + "?utm_source=test")))
+precondition(AudioImport.mediaID(sc).hasPrefix("soundcloud-"))
+XCTAssertEqual(AudioImport.mediaID(try AudioImport.mediaURL("https://youtu.be/pZw9veQ76fo")), "pZw9veQ76fo")
+for invalid in ["https://soundcloud.com/artist", "https://soundcloud.com/artist/sets/album", "https://soundcloud.com/artist/tracks", "https://soundcloud.com/artist/track/likes", "https://soundcloud.com/artist/track?secret_token=private", "https://soundcloud.com/artist/track/s-private", "https://soundcloud.com.evil.test/artist/track", "https://user:password@soundcloud.com/artist/track", "http://soundcloud.com/artist/track", "https://soundcloud.com:8443/artist/track", "https://soundcloud.com/artist/%2Ftrack", "file:///tmp/track.mp3"] {
+    XCTAssertThrowsError(try AudioImport.mediaURL(invalid))
+}
+print("PASS: public SoundCloud track validation, tracking cleanup, mixed-source deduplication, stable distinct cache IDs, unsafe/profile/set/private link rejection")
 let batchURLs = try AudioImport.youtubeURLs("https://youtu.be/pZw9veQ76fo\nhttps://www.youtube.com/watch?v=pZw9veQ76fo&list=ignored\nhttps://www.youtube.com/watch?v=abcdefghijk")
 XCTAssertEqual(batchURLs.count, 2)
 XCTAssertEqual(batchURLs[0].absoluteString, "https://www.youtube.com/watch?v=pZw9veQ76fo")

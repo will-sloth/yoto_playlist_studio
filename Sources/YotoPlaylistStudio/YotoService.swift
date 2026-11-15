@@ -5,16 +5,20 @@ import AppKit
 
 @MainActor
 final class YotoService: NSObject {
-    private var token = ""
+    private let authorization: YotoSession
+    private var token: String { authorization.accessToken }
     private let session: URLSession
-    init(session: URLSession = .shared, accessToken: String = "") {
-        self.session = session; self.token = accessToken
+    init(session: URLSession = .shared, accessToken: String = "", credentialStore: (any YotoCredentialStore)? = nil) {
+        self.session = session; self.authorization = YotoSession(session: session, accessToken: accessToken, store: credentialStore ?? YotoKeychainStore())
         super.init()
     }
+    private var loginAttempt = UUID()
     private var listener: NWListener?
     private var loginContinuation: CheckedContinuation<URL, Error>?
     private var loginTimeout: Task<Void, Never>?
-    var connected: Bool { !token.isEmpty }
+    var connected: Bool { authorization.connected }
+    var sessionNotice: String? { authorization.notice }
+    func restoreSession(clientID: String) async throws -> Bool { try await authorization.restore(clientID: clientID.trimmingCharacters(in: .whitespacesAndNewlines)) }
     private func finishLogin(_ result: Result<URL, Error>) {
         guard let continuation = loginContinuation else { return }
         loginContinuation = nil
@@ -22,16 +26,27 @@ final class YotoService: NSObject {
         loginTimeout?.cancel(); loginTimeout = nil
         continuation.resume(with: result)
     }
-    func disconnect() { finishLogin(.failure(StudioError("Sign-in cancelled."))); token = "" }
-    func login(clientID: String) async throws {
+    func cancelLogin() { loginAttempt = UUID(); finishLogin(.failure(CancellationError())) }
+    func disconnect() throws { cancelLogin(); try authorization.disconnect() }
+    static func authorizationURL(clientID: String, challenge: String, state: String, staySignedIn: Bool) throws -> URL {
+        let clientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clientID.isEmpty, clientID.unicodeScalars.allSatisfy(CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_").contains) else {
+            throw StudioError("Enter the Client ID from your Yoto public app, rather than a URL, client secret or copied label. Check the developer dashboard if Yoto shows an error before the login form.")
+        }
+        var url = URLComponents(string: "https://login.yotoplay.com/authorize")!
+        let scopes = "user:content:manage user:content:view user:icons:manage" + (staySignedIn ? " offline_access" : "")
+        url.queryItems = ["audience": "https://api.yotoplay.com", "scope": scopes, "response_type": "code", "client_id": clientID, "code_challenge": challenge, "code_challenge_method": "S256", "redirect_uri": "http://127.0.0.1:8787/callback", "state": state].map { URLQueryItem(name: $0.key, value: $0.value) }
+        return url.url!
+    }
+    func login(clientID: String, staySignedIn: Bool = true) async throws {
         let clientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clientID.isEmpty else { throw StudioError("Enter your Yoto developer client ID first.") }
         let verifier = UUID().uuidString + UUID().uuidString
         let state = UUID().uuidString
         let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
         let callback = "http://127.0.0.1:8787/callback"
-        var components = URLComponents(string: "https://login.yotoplay.com/authorize")!
-        components.queryItems = ["audience": "https://api.yotoplay.com", "scope": "user:content:manage user:content:view user:icons:manage", "response_type": "code", "client_id": clientID, "code_challenge": challenge, "code_challenge_method": "S256", "redirect_uri": callback, "state": state].map { URLQueryItem(name: $0.key, value: $0.value) }
+        let authURL = try Self.authorizationURL(clientID: clientID, challenge: challenge, state: state, staySignedIn: staySignedIn)
+        let attempt = UUID(); loginAttempt = attempt
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: 8787)
         let server = try NWListener(using: parameters)
@@ -43,7 +58,7 @@ final class YotoService: NSObject {
                     guard let self else { return }
                     switch status {
                     case .ready:
-                        if !NSWorkspace.shared.open(components.url!) { self.finishLogin(.failure(StudioError("Could not open your browser."))) }
+                        if !NSWorkspace.shared.open(authURL) { self.finishLogin(.failure(StudioError("Could not open your browser."))) }
                     case .failed:
                         self.finishLogin(.failure(StudioError("Could not start sign-in. Port 8787 may already be in use.")))
                     default: break
@@ -85,13 +100,13 @@ final class YotoService: NSObject {
         form.queryItems = ["grant_type": "authorization_code", "client_id": clientID, "code_verifier": verifier, "code": code, "redirect_uri": callback].map { URLQueryItem(name: $0.key, value: $0.value) }
         request.httpBody = form.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
         let result = try await perform(request)
-        guard let access = result["access_token"] as? String else { throw StudioError("Yoto returned no access token.") }
-        token = access
+        guard loginAttempt == attempt, !Task.isCancelled else { throw CancellationError() }
+        try authorization.accept(result, clientID: clientID, remember: staySignedIn)
     }
     private func perform(_ request: URLRequest) async throws -> JSON {
         var request = request
         request.timeoutInterval = 30
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await (request.url?.host == "api.yotoplay.com" ? authorization.data(for: request) : session.data(for: request))
         guard let http = response as? HTTPURLResponse else { throw StudioError("Yoto did not respond.") }
         guard (200..<300).contains(http.statusCode) else {
             if http.statusCode == 401 { throw StudioError("Your Yoto session expired. Disconnect and sign in again.") }
@@ -117,7 +132,7 @@ final class YotoService: NSObject {
         guard connected else { throw StudioError("Connect your Yoto account first.") }
         var request = URLRequest(url: URL(string: "https://api.yotoplay.com" + path)!)
         request.httpMethod = method
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if method == "GET", path.hasPrefix("/content/") { request.cachePolicy = .reloadIgnoringLocalCacheData }
         request.setValue(type, forHTTPHeaderField: "Content-Type")
         request.httpBody = body
         return try await perform(request)
@@ -165,6 +180,19 @@ final class YotoService: NSObject {
         guard let icon = result["displayIcon"] as? JSON, let id = icon["mediaId"] as? String else { throw StudioError("Yoto did not return an uploaded icon ID.") }
         return "yoto:#" + id
     }
+    static func processingFailure(_ transcode: JSON) -> String? {
+        // Error fields can coexist with null result fields in an HTTP 202 body.
+        if let error = transcode["error"] as? String, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return String(error.prefix(600)) }
+        if let error = transcode["error"] as? JSON {
+            for key in ["message", "description", "code"] {
+                if let text = error[key] as? String, !text.isEmpty { return String(text.prefix(600)) }
+            }
+            if !error.isEmpty { return "Yoto reported an audio conversion error." }
+        }
+        if let error = transcode["error"] as? Bool, error { return "Yoto reported an audio conversion error." }
+        if transcode["status"] as? String == "failed" || transcode["status"] as? String == "error" { return "Yoto reported an audio conversion error." }
+        return nil
+    }
     func uploadAudio(_ file: URL, progress: @escaping (String) -> Void) async throws -> JSON {
         let activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Upload and process audio for Yoto")
         defer { ProcessInfo.processInfo.endActivity(activity) }
@@ -183,7 +211,7 @@ final class YotoService: NSObject {
             // The signed storage URL carries its own authorization. Never forward the Yoto token.
             progress("Uploading MP3 to Yoto…")
             let (_, uploaded) = try await session.upload(for: put, fromFile: file)
-            guard let http = uploaded as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw StudioError("Yoto's audio upload failed. The playlist has not changed.") }
+            guard let http = uploaded as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw StudioError("Sending the MP3 to Yoto failed (HTTP \((uploaded as? HTTPURLResponse)?.statusCode ?? 0)). The playlist has not changed.") }
         }
         progress("Waiting for Yoto to process the audio…")
         let safeID = id.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
@@ -194,24 +222,49 @@ final class YotoService: NSObject {
             progress("Waiting for Yoto audio processing (check \(attempt + 1))…")
             var poll = URLRequest(url: URL(string: "https://api.yotoplay.com/media/upload/\(safeID)/transcoded?loudnorm=false")!)
             poll.timeoutInterval = 30
-            poll.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            let (data, response) = try await session.data(for: poll)
+            let (data, response) = try await authorization.data(for: poll)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             let object = (try? JSONSerialization.jsonObject(with: data)) as? JSON ?? [:]
             let transcodeFields = object["transcode"] as? JSON ?? [:]
             var diagnostic: JSON = ["httpStatus": code, "responseFields": object.keys.sorted(), "transcodeFields": transcodeFields.keys.sorted(), "check": attempt + 1]
             if let error = object["error"] as? JSON { diagnostic["errorCode"] = error["code"]; diagnostic["errorMessage"] = error["message"] }
             if let state = transcodeFields["status"] as? String { diagnostic["status"] = state }
+            if let reason = Self.processingFailure(transcodeFields) { diagnostic["processingError"] = reason }
             if let info = transcodeFields["transcodedInfo"] as? JSON { diagnostic["mediaFields"] = info.keys.sorted() }
             if let data = try? JSONSerialization.data(withJSONObject: diagnostic, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: FileManager.default.temporaryDirectory.appendingPathComponent("yoto-studio-processing-" + safeID + ".json"), options: .atomic) }
             if code == 401 { throw StudioError("Your Yoto sign-in expired. Sign in again before uploading.") }
             if code == 403 { throw StudioError("Yoto denied audio access. Check user:content:manage in the developer app.") }
+            if (200..<300).contains(code), let reason = Self.processingFailure(transcodeFields) {
+                throw StudioError("Yoto could not process the audio: " + reason + ". Your local MP3 is kept. For long recordings, try shorter tracks.")
+            }
             if (200..<300).contains(code), let object = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
-               let transcode = object["transcode"] as? JSON, transcode["transcodedSha256"] as? String != nil { return transcode }
+               let transcode = object["transcode"] as? JSON, let hash = transcode["transcodedSha256"] as? String, !hash.isEmpty { return transcode }
             guard (200..<300).contains(code) || code == 404 else { throw StudioError("Yoto audio processing failed (HTTP \(code)). The playlist has not changed.") }
             try await Task.sleep(nanoseconds: 2_000_000_000)
         }
         throw StudioError("Yoto audio processing timed out. No track was appended; you can retry.")
+    }
+    func saveOrder(_ order: [String], baseline: JSON, backup: (JSON) throws -> Void = { _ in }) async throws -> JSON {
+        guard let id = baseline["cardId"] as? String else { throw StudioError("Choose a saved playlist first.") }
+        let latest = try await card(id)
+        guard try PlaylistOrder.sameContent(latest, baseline) else {
+            throw StudioError("This playlist’s tracks or artwork changed. Your order is still staged. Choose Reload latest order to start from the current playlist.")
+        }
+        let payload = try PlaylistOrder.payload(latest, order: order)
+        try backup(latest)
+        return try await save(payload)
+    }
+    func appendAudioBatch(_ tracks: [(transcode: JSON, title: String)], artwork: [Int: String] = [:], to id: String, backup: (JSON) throws -> Void = { _ in }) async throws -> JSON {
+        // Appending does not depend on the view's old snapshot. Build from the
+        // server's current content so successive batches and background edits survive.
+        let latest = try await card(id)
+        guard artwork.keys.allSatisfy({ tracks.indices.contains($0) }) else { throw StudioError("The artwork selection does not match this audio batch.") }
+        var payload = try AudioImport.appendBatch(tracks, to: latest)
+        let start = ((latest["content"] as? JSON)?["chapters"] as? [JSON] ?? []).count
+        let references = Dictionary(uniqueKeysWithValues: artwork.map { ("\(start + $0.key):0", $0.value) })
+        if !references.isEmpty { payload = try CardEditor.applying(references, to: payload) }
+        try backup(latest)
+        return try await save(payload)
     }
     func createPlaylist(_ payload: JSON) async throws -> JSON {
         guard payload["cardId"] == nil, let content = payload["content"] as? JSON,

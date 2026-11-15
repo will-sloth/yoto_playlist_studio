@@ -5,6 +5,8 @@ import UniformTypeIdentifiers
 @MainActor
 final class Studio: ObservableObject {
     @Published var clientID = UserDefaults.standard.string(forKey: "clientID") ?? ""
+    @Published var staySignedIn = UserDefaults.standard.object(forKey: "staySignedIn") as? Bool ?? true
+    @Published var signingIn = false
     @Published var playlists: [Playlist] = []
     @Published var newPlaylists: [String: JSON] = [:]
     @Published var icons: [LibraryIcon] = []
@@ -89,6 +91,7 @@ final class Studio: ObservableObject {
     @Published var connected = false
     @Published var demo = false
     @Published var review = false
+    @Published var pendingMove: PlaylistMover?
     @Published var demoArt: [String: ArtChoice] = [:]
     let api = YotoService()
     var rows: [TrackRow] { CardEditor.rows(card) }
@@ -98,7 +101,7 @@ final class Studio: ObservableObject {
         busy = true
         Task {
             defer { busy = false }
-            do { try await action() } catch { self.error = error.localizedDescription }
+            do { try await action() } catch is CancellationError { self.status = "Sign-in cancelled." } catch { if !self.demo { self.connected = self.api.connected }; self.error = error.localizedDescription }
         }
     }
     func startPlaylist(title: String) throws {
@@ -119,23 +122,48 @@ final class Studio: ObservableObject {
             self.status = "Playlist list refreshed."
         }
     }
-    func connect() {
+    private var attemptedRestore = false
+    func restoreSavedSession() {
+        guard !attemptedRestore, !connected, !demo else { return }
+        attemptedRestore = true
         run {
-            try await self.api.login(clientID: self.clientID)
+            do {
+                guard try await self.api.restoreSession(clientID: self.clientID) else { return }
+                self.connected = true
+                self.playlists = try await self.api.playlists()
+                self.status = "Signed in automatically · \(self.playlists.count) playlists"
+                self.icons = try await self.api.icons()
+            } catch {
+                self.connected = self.api.connected
+                self.status = error.localizedDescription
+            }
+        }
+    }
+    func connect() {
+        guard !busy else { return }
+        signingIn = true
+        UserDefaults.standard.set(staySignedIn, forKey: "staySignedIn")
+        run {
+            defer { self.signingIn = false }
+            try await self.api.login(clientID: self.clientID, staySignedIn: self.staySignedIn)
             UserDefaults.standard.set(self.clientID, forKey: "clientID")
+            self.pendingMove = nil
             self.connected = true; self.demo = false
             self.suggestions = [:]; self.rejected = [:]; self.newPlaylists = [:]
             self.card = [:]; self.draft = [:]; self.selectedTracks = []; self.selectedPlaylist = nil
             self.playlists = try await self.api.playlists()
-            self.status = "Connected · \(self.playlists.count) playlists"
+            self.status = self.api.sessionNotice ?? (self.staySignedIn ? "Connected · \(self.playlists.count) playlists · sign-in saved in Keychain" : "Connected · \(self.playlists.count) playlists · this session only")
             self.icons = try await self.api.icons()
         }
     }
     func disconnect() {
+        pendingMove = nil
         suggestions = [:]; rejected = [:]
-        api.disconnect(); newPlaylists = [:]; connected = false; demo = false; playlists = []; icons = []
+        var forgotSession = true
+        do { try api.disconnect() } catch { forgotSession = false; self.error = error.localizedDescription }
+        newPlaylists = [:]; connected = false; demo = false; playlists = []; icons = []
         selectedPlaylist = nil; card = [:]; draft = [:]; selectedTracks = []
-        status = "Disconnected."
+        status = forgotSession ? "Disconnected · saved sign-in removed." : "Disconnected · saved sign-in could not be removed. Use Forget saved sign-in to retry."
     }
     func load(_ id: String) {
         guard id != selectedPlaylist else { return }
@@ -238,6 +266,9 @@ private struct AudioImportSelection: Identifiable {
 struct StudioView: View {
     @EnvironmentObject var studio: Studio
     @State private var settings = false
+    @State private var moveTracksSheet = false
+    @State private var reorderTracksSheet = false
+    @State private var duplicateCheckSheet = false
     @State private var audioSelection: AudioImportSelection?
     @State private var publicAudio = false
     @State private var newPlaylistSheet = false
@@ -265,7 +296,7 @@ struct StudioView: View {
                     }
                     Spacer()
                     if studio.busy { ProgressView().controlSize(.small) }
-                    Button("Add audio…") { importTracks = []; audioSelection = AudioImportSelection(tracks: []) }.disabled(studio.selectedPlaylist == nil || studio.hasChanges || studio.busy).help(studio.hasChanges ? "Apply or discard staged artwork before adding audio" : "Import YouTube links or public audio files")
+                    Button("Add audio…") { importTracks = []; audioSelection = AudioImportSelection(tracks: []) }.disabled(studio.selectedPlaylist == nil || studio.hasChanges || studio.busy).help(studio.hasChanges ? "Apply or discard staged artwork before adding audio" : "Import YouTube/SoundCloud links, public audio or local MP3s")
                     Button("Public-domain audio…") { importTracks = []; publicAudio = true }.disabled(studio.selectedPlaylist == nil || studio.hasChanges || studio.busy)
                     Button("Review \(studio.draft.count) changes") { studio.review = true }.buttonStyle(.borderedProminent).tint(accent).disabled(!studio.hasChanges || studio.busy)
                 }
@@ -286,7 +317,11 @@ struct StudioView: View {
                 }
             }.padding(28).background(Color(nsColor: .windowBackgroundColor))
         }.tint(accent)
+        .task { studio.restoreSavedSession() }
         .disabled(studio.busy)
+        .overlay(alignment: .bottomTrailing) {
+            if studio.signingIn { Button("Cancel sign-in") { studio.api.cancelLogin() }.padding(20) }
+        }
         .sheet(item: $audioSelection) { selection in
             AudioImportSheet(card: studio.card, service: studio.api, isDemo: studio.demo, initialTracks: selection.tracks, createsPlaylist: studio.selectedPlaylist.map { studio.newPlaylists[$0] != nil } ?? false) { payload in
                 if let previous = studio.selectedPlaylist, studio.newPlaylists.removeValue(forKey: previous) != nil {
@@ -320,6 +355,15 @@ struct StudioView: View {
                     }.buttonStyle(.borderedProminent)
                 }
             }.padding(26).frame(width: 420)
+        }
+        .sheet(isPresented: $duplicateCheckSheet) {
+            DuplicateCheckSheet(source: studio.card).environmentObject(studio)
+        }
+        .sheet(isPresented: $reorderTracksSheet) {
+            ReorderTracksSheet(source: studio.card).environmentObject(studio)
+        }
+        .sheet(isPresented: $moveTracksSheet) {
+            MoveTracksSheet(selected: studio.selectedTracks, source: studio.card).environmentObject(studio)
         }
         .sheet(isPresented: $settings) { connectionSheet }
         .sheet(isPresented: $studio.review) { reviewSheet }
@@ -365,6 +409,14 @@ struct StudioView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack { Text("1. Choose tracks").font(.headline); Spacer(); Button("All") { studio.selectedTracks = Set(studio.rows.map(\.id)) }.disabled(studio.rows.isEmpty) }
             Text("Select tracks to choose art manually, or suggest an icon for each song.").font(.caption).foregroundStyle(.secondary)
+            Button("Check duplicates…", systemImage: "doc.on.doc") { duplicateCheckSheet = true }
+                .disabled(studio.selectedPlaylist == nil || studio.busy || (!studio.connected && !studio.demo) || studio.selectedPlaylist.map { studio.newPlaylists[$0] != nil } == true)
+            Button("Reorder tracks…", systemImage: "arrow.up.arrow.down") { reorderTracksSheet = true }
+                .disabled(studio.rows.count < 2 || studio.hasChanges || studio.busy || studio.pendingMove != nil || (!studio.connected && !studio.demo) || studio.selectedPlaylist.map { studio.newPlaylists[$0] != nil } == true)
+                .help(studio.hasChanges ? "Apply or discard staged artwork before reordering tracks" : "Drag tracks into order, then save")
+            Button(studio.pendingMove == nil ? "Move selected tracks to playlist…" : "Resume track move…") { moveTracksSheet = true }
+                .disabled(!studio.connected || studio.demo || studio.hasChanges || studio.busy || (studio.pendingMove == nil && (studio.selectedTracks.isEmpty || studio.selectedPlaylist.map { studio.newPlaylists[$0] != nil } == true)))
+                .help(studio.hasChanges ? "Apply or discard staged artwork before moving tracks" : "Move selected audio and artwork to another saved playlist")
             Button("Suggest icons for songs", systemImage: "sparkles") { studio.suggestIcons() }.disabled(studio.rows.isEmpty)
             Text("Existing artwork is kept. Automatic suggestions appear only for tracks without art.").font(.caption2).foregroundStyle(.secondary)
             if studio.connected && !studio.rows.isEmpty {
@@ -519,8 +571,11 @@ struct StudioView: View {
             Text("http://127.0.0.1:8787/callback").font(.system(.callout, design: .monospaced)).textSelection(.enabled)
             Link("Open Yoto developer dashboard ↗", destination: URL(string: "https://dashboard.yoto.dev/")!)
             TextField("Yoto Client ID", text: $studio.clientID).textFieldStyle(.roundedBorder)
-            Text("Sign in securely in your browser. No client secret is needed. Your session is kept in memory and ends when you quit; the Client ID is remembered.").font(.caption).foregroundStyle(.secondary)
-            HStack { Button("Close") { settings = false }; Spacer(); if studio.connected { Button("Disconnect") { studio.disconnect(); settings = false } }; Button("Sign in with Yoto") { settings = false; studio.connect() }.buttonStyle(.borderedProminent).disabled(studio.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
+            Toggle("Stay signed in on this Mac", isOn: $studio.staySignedIn)
+            Text(studio.staySignedIn ? "Save sign-in in macOS Keychain and request automatic renewal. Disconnect removes the saved sign-in. No password or client secret is stored." : "Sign in for this session only, without requesting renewable access or saving tokens. Previous saved sign-in is removed after a successful session-only sign-in.").font(.caption).foregroundStyle(.secondary)
+            Text("If Yoto shows ‘Oops’ before the login form, check the Client ID, Public Client type and callback above in the developer dashboard. You can also retry with Stay signed in turned off. Cancel a pending sign-in before retrying.").font(.caption).foregroundStyle(.secondary)
+            if let notice = studio.api.sessionNotice { Text(notice).font(.caption).foregroundStyle(.orange) }
+            HStack { Button("Close") { settings = false }; Spacer(); Button(studio.connected ? "Disconnect" : "Forget saved sign-in") { studio.disconnect(); settings = false }; Button("Sign in with Yoto") { settings = false; studio.connect() }.buttonStyle(.borderedProminent).disabled(studio.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
         }.padding(30).frame(width: 480)
     }
     private var reviewSheet: some View {
